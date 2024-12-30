@@ -10,7 +10,6 @@ use quick_xml::reader::Reader;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Cursor;
@@ -45,18 +44,27 @@ fn rewrite_src(element: &mut BytesStart, src: &str) {
     }
 }
 
+struct FileToZip {
+    name: String,
+    contents: Vec<u8>,
+    compressed: bool,
+}
+
 pub async fn embed_images(input_path: String, output_path: String) {
     let file = File::open(input_path).unwrap();
     let mut zip = zip::ZipArchive::new(file).unwrap();
 
     let mut new_zip = zip::ZipWriter::new(File::create(output_path).unwrap());
-    let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
+    let (tx, rx) = std::sync::mpsc::channel::<FileToZip>();
     let zip_task = tokio::task::spawn_blocking(move || {
-        while let Ok((file_name, contents)) = rx.recv() {
-            new_zip
-                .start_file(file_name, SimpleFileOptions::default())
-                .unwrap();
-            new_zip.write_all(&contents).unwrap();
+        while let Ok(file) = rx.recv() {
+            let mut options = SimpleFileOptions::default();
+            if !file.compressed {
+                options = options.compression_method(zip::CompressionMethod::Stored);
+            }
+
+            new_zip.start_file(file.name, options).unwrap();
+            new_zip.write_all(&file.contents).unwrap();
         }
 
         new_zip.finish().unwrap();
@@ -75,7 +83,11 @@ pub async fn embed_images(input_path: String, output_path: String) {
             // todo: should use cheap copy?
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer).unwrap();
-            tx.send((file.name().to_string(), buffer)).unwrap();
+            tx.send(FileToZip {
+                name: file.name().to_string(),
+                contents: buffer,
+                compressed: file.compression() != zip::CompressionMethod::Stored,
+            }).unwrap();
             continue;
         }
 
@@ -146,8 +158,12 @@ pub async fn embed_images(input_path: String, output_path: String) {
             buf.clear();
         }
 
-        tx.send((file_name, writer.into_inner().into_inner()))
-            .unwrap();
+        tx.send(FileToZip {
+            name: file_name,
+            contents: writer.into_inner().into_inner(),
+            compressed: true,
+        })
+        .unwrap();
     }
 
     let mut recorded_stats = Vec::new();
@@ -160,7 +176,11 @@ pub async fn embed_images(input_path: String, output_path: String) {
         }
 
         added_images.insert(path.clone(), infer::get(&file_contents));
-        tx.send((path, file_contents)).unwrap();
+        tx.send(FileToZip {
+            name: path,
+            contents: file_contents,
+            compressed: false,
+        }).unwrap();
 
         let stats = download_manager.stats();
 
@@ -189,7 +209,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
         .find(|name| name.ends_with(".opf"))
         .expect("No .opf file found")
         .to_string();
-    let mut opf_file = zip.by_name(&opf_name).unwrap();
+    let opf_file = zip.by_name(&opf_name).unwrap();
 
     let buffered = BufReader::new(opf_file);
     let mut reader = Reader::from_reader(buffered);
@@ -249,8 +269,12 @@ pub async fn embed_images(input_path: String, output_path: String) {
         buf.clear();
     }
 
-    tx.send((opf_name, writer.into_inner().into_inner()))
-        .unwrap();
+    tx.send(FileToZip {
+        name: opf_name,
+        contents: writer.into_inner().into_inner(),
+        compressed: true,
+    })
+    .unwrap();
 
     drop(tx);
     zip_task.await.unwrap();
