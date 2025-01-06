@@ -3,6 +3,7 @@ use crate::downloader::DownloadManager;
 use crate::image_optimizer::optimize_image;
 use crate::image_optimizer::ImageOptimizationSettings;
 use crate::image_optimizer::OptimizeImageError;
+use futures::channel::oneshot;
 use futures::StreamExt;
 use indicatif::MultiProgress;
 use indicatif::ProgressBar;
@@ -25,6 +26,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use zip::write::SimpleFileOptions;
+use zip::ZIP64_BYTES_THR;
 
 fn compute_download_path(url: &Url) -> String {
     let mut hasher = Sha256::new();
@@ -74,22 +76,6 @@ pub async fn embed_images(input_path: String, output_path: String) {
     let file = File::open(input_path).unwrap();
     let mut zip = zip::ZipArchive::new(file).unwrap();
 
-    let mut new_zip = zip::ZipWriter::new(File::create(output_path).unwrap());
-    let (tx, rx) = std::sync::mpsc::channel::<FileToZip>();
-    let zip_task = tokio::task::spawn_blocking(move || {
-        while let Ok(file) = rx.recv() {
-            let mut options = SimpleFileOptions::default();
-            if !file.compressed {
-                options = options.compression_method(zip::CompressionMethod::Stored);
-            }
-
-            new_zip.start_file(file.name, options).unwrap();
-            new_zip.write_all(&file.contents).unwrap();
-        }
-
-        new_zip.finish().unwrap();
-    });
-
     let mut download_manager = DownloadManager::build(20).unwrap();
 
     let html_files = zip
@@ -110,12 +96,36 @@ pub async fn embed_images(input_path: String, output_path: String) {
     optimize_pb.set_style(sty.clone());
     optimize_pb.set_message("️⚙️ optimizing images");
 
+    let zip_pb = progress_bars.add(ProgressBar::new(0));
+    zip_pb.set_style(sty.clone());
+    zip_pb.set_message("📦 creating .epub");
+
+    let mut new_zip = zip::ZipWriter::new(File::create(output_path).unwrap());
+    let (tx, rx) = std::sync::mpsc::channel::<FileToZip>();
+    let cloned_zip_pb = zip_pb.clone();
     let mut image_info = HashMap::new();
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(10)
         .build()
         .unwrap();
+
+    let (zip_done_tx, zip_done_rx) = oneshot::channel::<()>();
+    pool.spawn(move || {
+        while let Ok(file) = rx.recv() {
+            let mut options = SimpleFileOptions::default();
+            if !file.compressed {
+                options = options.compression_method(zip::CompressionMethod::Stored);
+            }
+
+            new_zip.start_file(file.name, options).unwrap();
+            new_zip.write_all(&file.contents).unwrap();
+            cloned_zip_pb.inc(1);
+        }
+
+        new_zip.finish().unwrap();
+        zip_done_tx.send(()).unwrap();
+    });
 
     for i in 0..zip.len() {
         let mut file = zip.by_index(i).unwrap();
@@ -128,6 +138,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
             // todo: should use cheap copy?
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer).unwrap();
+            zip_pb.inc_length(1);
             tx.send(FileToZip {
                 name: file.name().to_string(),
                 contents: buffer,
@@ -240,6 +251,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
             buf.clear();
         }
 
+        zip_pb.inc_length(1);
         tx.send(FileToZip {
             name: file_name,
             contents: writer.into_inner().into_inner(),
@@ -274,6 +286,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
                 let optimized_image_cache = optimized_image_cache.clone();
                 let total_optimized_image_size = total_optimized_image_size.clone();
                 let optimize_pb = optimize_pb.clone();
+                let zip_pb = zip_pb.clone();
                 pool.spawn(move || {
                     match optimize_image(
                         &file_contents,
@@ -287,6 +300,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
                         Ok(optimized) => {
                             total_optimized_image_size
                                 .fetch_add(optimized.len(), std::sync::atomic::Ordering::Relaxed);
+                            zip_pb.inc_length(1);
                             tx.send(FileToZip {
                                 name: path,
                                 contents: optimized,
@@ -295,6 +309,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
                             .unwrap();
                         }
                         Err(OptimizeImageError::UnsupportedImageFormat(_)) => {
+                            zip_pb.inc_length(1);
                             tx.send(FileToZip {
                                 name: path,
                                 contents: file_contents,
@@ -385,6 +400,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
         buf.clear();
     }
 
+    zip_pb.inc_length(1);
     tx.send(FileToZip {
         name: opf_name,
         contents: writer.into_inner().into_inner(),
@@ -393,7 +409,9 @@ pub async fn embed_images(input_path: String, output_path: String) {
     .unwrap();
 
     drop(tx);
-    zip_task.await.unwrap();
+
+    // wait for thread pool
+    zip_done_rx.await.unwrap();
 
     let total_original_image_size =
         total_original_image_size.load(std::sync::atomic::Ordering::Relaxed);
