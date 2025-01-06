@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadManagerStats {
+    pub in_flight_requests: u64,
     pub downloaded_bytes: u64,
     pub downloaded_files: u64,
     pub cached_files: u64,
@@ -56,6 +58,8 @@ pub enum DownloadManagerError {
     HeaderParse(#[from] reqwest::header::ToStrError),
     #[error("URL parse error {0}")]
     UrlParse(#[source] reqwest::Error),
+    #[error("Request error {0}")]
+    Request(#[from] reqwest::Error),
 }
 
 impl DownloadManager {
@@ -99,8 +103,8 @@ impl DownloadManager {
             if let Some(parsed) = CacheControl::from_value(cache_control.to_str().unwrap()) {
                 if let Some(max_age) = parsed.max_age {
                     inner.url_to_etag_cache.set(
-                        response.url().as_str().to_string(),
-                        etag,
+                        &response.url().as_str().to_string(),
+                        &etag,
                         max_age.as_secs(),
                     )?;
                 }
@@ -110,13 +114,9 @@ impl DownloadManager {
         Ok(())
     }
 
-    async fn download<U: IntoUrl + Send>(
-        inner: &Inner,
-        url: U,
-    ) -> Result<(Url, Vec<u8>), DownloadManagerError> {
+    async fn download(inner: &Inner, url: Url) -> Result<(Url, Vec<u8>), DownloadManagerError> {
         let _permit = inner.semaphore.acquire().await.unwrap();
 
-        let url = url.into_url().map_err(DownloadManagerError::UrlParse)?;
         let url_str = url.as_str().to_string();
 
         if let Some(etag) = inner.url_to_etag_cache.get(&url_str)? {
@@ -129,6 +129,13 @@ impl DownloadManager {
         }
 
         let mut response = inner.client.get(url.clone()).send().await.unwrap(); // todo: retry on error
+        if let Err(err) = response.error_for_status_ref() {
+            inner
+                .http_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(err.into());
+        }
+
         Self::update_url_etag_cache(inner, &response)?;
         let etag = Self::cache_key_from_response(&response)?;
         // File may still exist/be unmodified, but past its cache-control expiry
@@ -147,9 +154,7 @@ impl DownloadManager {
             file.extend_from_slice(&chunk);
         }
 
-        inner
-            .etag_to_file_cache
-            .set(etag, file.clone(), 1000000000000)?; // etag should be immutable
+        inner.etag_to_file_cache.set(&etag, &file, 1000000000000)?; // etag should be immutable
 
         inner
             .downloaded_files
@@ -158,15 +163,16 @@ impl DownloadManager {
         Ok((url, file))
     }
 
-    pub fn queue_download<U: IntoUrl + Send + Clone + 'static>(&self, url: U) {
+    pub fn queue_download(&self, url: Url) {
         let inner = self.inner.clone();
 
         self.in_flight
-            .push(async move { Self::download(&inner, url.clone()).await }.boxed());
+            .push(async move { Self::download(&inner, url).await }.boxed());
     }
 
     pub fn stats(&self) -> DownloadManagerStats {
         DownloadManagerStats {
+            in_flight_requests: self.in_flight.len() as u64,
             downloaded_bytes: self
                 .inner
                 .downloaded_bytes

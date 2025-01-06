@@ -16,11 +16,20 @@ pub enum DiskCacheError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Clone)]
 pub struct DiskCache<K, V> {
     conn: Arc<Mutex<Connection>>,
     _k: std::marker::PhantomData<K>,
     _v: std::marker::PhantomData<V>,
+}
+
+impl<K, V> Clone for DiskCache<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            _k: std::marker::PhantomData,
+            _v: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<K: serde::ser::Serialize, V: serde::ser::Serialize + DeserializeOwned> DiskCache<K, V> {
@@ -29,7 +38,7 @@ impl<K: serde::ser::Serialize, V: serde::ser::Serialize + DeserializeOwned> Disk
         let dir = cache_dir.join(env!("CARGO_PKG_NAME"));
         fs::create_dir_all(dir.clone())?;
         let db_path = dir.join(format!("{}.db", name));
-        println!("Using cache at {:?}", db_path);
+        // println!("Using cache at {:?}", db_path);
 
         let conn = Connection::open(db_path)?;
 
@@ -49,7 +58,7 @@ impl<K: serde::ser::Serialize, V: serde::ser::Serialize + DeserializeOwned> Disk
         })
     }
 
-    pub fn set(&self, key: K, value: V, expires_in_seconds: u64) -> Result<(), DiskCacheError> {
+    pub fn set(&self, key: &K, value: &V, expires_in_seconds: u64) -> Result<(), DiskCacheError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -60,8 +69,8 @@ impl<K: serde::ser::Serialize, V: serde::ser::Serialize + DeserializeOwned> Disk
             "INSERT INTO cache (key, value, expiry) VALUES (?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, expiry = excluded.expiry",
             params![
-                bincode::serialize(&key)?,
-                bincode::serialize(&value)?,
+                bincode::serialize(key)?,
+                bincode::serialize(value)?,
                 now + expires_in_seconds,
             ],
         )?;

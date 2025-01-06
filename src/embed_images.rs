@@ -1,6 +1,12 @@
+use crate::disk_cache::DiskCache;
 use crate::downloader::DownloadManager;
+use crate::image_optimizer::optimize_image;
+use crate::image_optimizer::ImageOptimizationSettings;
+use crate::image_optimizer::OptimizeImageError;
 use futures::StreamExt;
-use human_bytes::human_bytes;
+use indicatif::MultiProgress;
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
 use pathdiff::diff_paths;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::BytesStart;
@@ -16,12 +22,14 @@ use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use zip::write::SimpleFileOptions;
 
 fn compute_download_path(url: &Url) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_str());
-    format!("_embedded/{}.jpeg", hex::encode(hasher.finalize()))
+    format!("_embedded/{}", hex::encode(hasher.finalize()))
 }
 
 fn rewrite_src(element: &mut BytesStart, src: &str) {
@@ -50,7 +58,19 @@ struct FileToZip {
     compressed: bool,
 }
 
+#[derive(Debug)]
+struct ImageInfo {
+    mimetype: Option<infer::Type>,
+    displayed_width: Option<u32>,
+}
+
 pub async fn embed_images(input_path: String, output_path: String) {
+    let sty = ProgressStyle::with_template(
+        "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg} ({eta})",
+    )
+    .unwrap()
+    .progress_chars("##-");
+
     let file = File::open(input_path).unwrap();
     let mut zip = zip::ZipArchive::new(file).unwrap();
 
@@ -72,6 +92,31 @@ pub async fn embed_images(input_path: String, output_path: String) {
 
     let mut download_manager = DownloadManager::build(20).unwrap();
 
+    let html_files = zip
+        .file_names()
+        .filter(|name| name.ends_with(".html"))
+        .collect::<Vec<_>>();
+
+    let progress_bars = MultiProgress::new();
+    let html_pb = progress_bars.add(ProgressBar::new(html_files.len() as u64));
+    html_pb.set_style(sty.clone());
+    html_pb.set_message("🔍 scanning source for <img/> tags");
+
+    let download_pb = progress_bars.add(ProgressBar::new(0));
+    download_pb.set_style(sty.clone());
+    download_pb.set_message("⬇️ downloading images");
+
+    let optimize_pb = progress_bars.add(ProgressBar::new(0));
+    optimize_pb.set_style(sty.clone());
+    optimize_pb.set_message("️⚙️ optimizing images");
+
+    let mut image_info = HashMap::new();
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(10)
+        .build()
+        .unwrap();
+
     for i in 0..zip.len() {
         let mut file = zip.by_index(i).unwrap();
 
@@ -87,7 +132,8 @@ pub async fn embed_images(input_path: String, output_path: String) {
                 name: file.name().to_string(),
                 contents: buffer,
                 compressed: file.compression() != zip::CompressionMethod::Stored,
-            }).unwrap();
+            })
+            .unwrap();
             continue;
         }
 
@@ -124,26 +170,62 @@ pub async fn embed_images(input_path: String, output_path: String) {
                             });
 
                             if let Some(candidate) = largest {
+                                let width: Option<u32> = e
+                                    .try_get_attribute(b"width")
+                                    .unwrap()
+                                    .map(|w| String::from_utf8_lossy(&w.value).parse().unwrap());
+
                                 let url: Url = candidate.url.parse().unwrap();
                                 let path = compute_download_path(&url);
-                                download_manager.queue_download(url);
-                                let html_dir = Path::new(&file_name).parent().unwrap();
-                                rewrite_src(
-                                    &mut e,
-                                    diff_paths(path, html_dir).unwrap().to_str().unwrap(),
-                                );
+                                if image_info
+                                    .insert(
+                                        url.clone(),
+                                        ImageInfo {
+                                            mimetype: None,
+                                            displayed_width: width,
+                                        },
+                                    )
+                                    .is_none()
+                                {
+                                    download_pb.inc_length(1);
+                                    optimize_pb.inc_length(1);
+                                    download_manager.queue_download(url);
+                                    let html_dir = Path::new(&file_name).parent().unwrap();
+                                    rewrite_src(
+                                        &mut e,
+                                        diff_paths(path, html_dir).unwrap().to_str().unwrap(),
+                                    );
+                                }
                                 writer.write_event(Event::Empty(e)).unwrap();
                             }
                         } else if let Ok(Some(src)) = e.try_get_attribute(b"src") {
                             if src.value.starts_with(b"http") {
+                                let width: Option<u32> = e
+                                    .try_get_attribute(b"width")
+                                    .unwrap()
+                                    .map(|w| String::from_utf8_lossy(&w.value).parse().unwrap());
+
                                 let url: Url = String::from_utf8_lossy(&src.value).parse().unwrap();
                                 let path = compute_download_path(&url);
-                                download_manager.queue_download(url);
-                                let html_dir = Path::new(&file_name).parent().unwrap();
-                                rewrite_src(
-                                    &mut e,
-                                    diff_paths(path, html_dir).unwrap().to_str().unwrap(),
-                                );
+                                if image_info
+                                    .insert(
+                                        url.clone(),
+                                        ImageInfo {
+                                            mimetype: None,
+                                            displayed_width: width,
+                                        },
+                                    )
+                                    .is_none()
+                                {
+                                    download_pb.inc_length(1);
+                                    optimize_pb.inc_length(1);
+                                    download_manager.queue_download(url);
+                                    let html_dir = Path::new(&file_name).parent().unwrap();
+                                    rewrite_src(
+                                        &mut e,
+                                        diff_paths(path, html_dir).unwrap().to_str().unwrap(),
+                                    );
+                                }
                                 writer.write_event(Event::Empty(e)).unwrap();
                             }
                         } else {
@@ -164,43 +246,74 @@ pub async fn embed_images(input_path: String, output_path: String) {
             compressed: true,
         })
         .unwrap();
+
+        html_pb.inc(1);
     }
 
-    let mut recorded_stats = Vec::new();
+    let optimized_image_cache = DiskCache::create("optimized_images").unwrap();
 
-    let mut added_images = HashMap::new();
-    while let Some(Ok((url, file_contents))) = download_manager.next().await {
-        let path = compute_download_path(&url);
-        if added_images.contains_key(&path) {
-            continue;
+    let total_original_image_size = Arc::new(AtomicUsize::new(0));
+    let total_optimized_image_size = Arc::new(AtomicUsize::new(0));
+
+    while let Some(item) = download_manager.next().await {
+        match item {
+            Ok((url, file_contents)) => {
+                total_original_image_size
+                    .fetch_add(file_contents.len(), std::sync::atomic::Ordering::Relaxed);
+
+                download_pb.inc(1);
+
+                let path = compute_download_path(&url);
+                let width = {
+                    let image_info = image_info.get_mut(&url).unwrap();
+                    image_info.mimetype = infer::get(&file_contents);
+                    image_info.displayed_width
+                };
+
+                let tx = tx.clone();
+                let optimized_image_cache = optimized_image_cache.clone();
+                let total_optimized_image_size = total_optimized_image_size.clone();
+                let optimize_pb = optimize_pb.clone();
+                pool.spawn(move || {
+                    match optimize_image(
+                        &file_contents,
+                        ImageOptimizationSettings {
+                            is_grayscale: true,
+                            key: path.clone(),
+                            max_width: Some(width.map(|w| w.min(1200)).unwrap_or(1200)),
+                        },
+                        optimized_image_cache,
+                    ) {
+                        Ok(optimized) => {
+                            total_optimized_image_size
+                                .fetch_add(optimized.len(), std::sync::atomic::Ordering::Relaxed);
+                            tx.send(FileToZip {
+                                name: path,
+                                contents: optimized,
+                                compressed: false,
+                            })
+                            .unwrap();
+                        }
+                        Err(OptimizeImageError::UnsupportedImageFormat(_)) => {
+                            tx.send(FileToZip {
+                                name: path,
+                                contents: file_contents,
+                                compressed: false,
+                            })
+                            .unwrap();
+                        }
+                        Err(e) => {
+                            panic!("Error optimizing image: {:?}", e);
+                        }
+                    }
+
+                    optimize_pb.inc(1);
+                });
+            }
+            Err(e) => {
+                // panic!("Error downloading image: {:?}", e);
+            }
         }
-
-        added_images.insert(path.clone(), infer::get(&file_contents));
-        tx.send(FileToZip {
-            name: path,
-            contents: file_contents,
-            compressed: false,
-        }).unwrap();
-
-        let stats = download_manager.stats();
-
-        recorded_stats.push(stats);
-
-        // Average speed from the last 5 seconds:
-        let last_5_seconds = recorded_stats.iter().rev().take(5).collect::<Vec<_>>();
-        let speed = last_5_seconds
-            .windows(2)
-            .map(|pair| pair[0].speed(*pair[1]))
-            .sum::<f64>()
-            / last_5_seconds.len() as f64;
-
-        println!(
-            "Speed: {}/s, Downloaded: {}, Cached: {}, HTTP errors: {}",
-            human_bytes(speed),
-            stats.downloaded_files,
-            stats.cached_files,
-            stats.http_errors
-        );
     }
 
     // Rewrite package file
@@ -228,7 +341,9 @@ pub async fn embed_images(input_path: String, output_path: String) {
                 if e.name() == QName(b"manifest") {
                     writer.write_event(Event::Start(e.clone())).unwrap();
 
-                    for (path, mime) in added_images.iter() {
+                    for (url, info) in image_info.iter() {
+                        let path = compute_download_path(url);
+
                         writer
                             .write_event(Event::Empty(
                                 BytesStart::new("item")
@@ -238,7 +353,8 @@ pub async fn embed_images(input_path: String, output_path: String) {
                                             Attribute::from(("href".as_bytes(), path.as_bytes())),
                                             Attribute::from((
                                                 "media-type".as_bytes(),
-                                                mime.map(|m| m.mime_type())
+                                                info.mimetype
+                                                    .map(|m| m.mime_type())
                                                     .unwrap_or("application/octet-stream")
                                                     .as_bytes(),
                                             )),
@@ -278,4 +394,19 @@ pub async fn embed_images(input_path: String, output_path: String) {
 
     drop(tx);
     zip_task.await.unwrap();
+
+    let total_original_image_size =
+        total_original_image_size.load(std::sync::atomic::Ordering::Relaxed);
+    let total_optimized_image_size =
+        total_optimized_image_size.load(std::sync::atomic::Ordering::Relaxed);
+
+    progress_bars
+        .println(format!(
+            "Saved {} ({:.1}%) by optimizing images.",
+            human_bytes::human_bytes(
+                total_original_image_size as f64 - total_optimized_image_size as f64
+            ),
+            100.0 - (total_optimized_image_size as f64 / total_original_image_size as f64) * 100.0
+        ))
+        .unwrap();
 }

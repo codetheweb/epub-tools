@@ -4,6 +4,7 @@ use embed_images::embed_images;
 mod disk_cache;
 mod downloader;
 mod embed_images;
+mod image_optimizer;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
