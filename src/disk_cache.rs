@@ -106,3 +106,10 @@ impl<K: serde::ser::Serialize, V: serde::ser::Serialize + DeserializeOwned> Disk
         Ok(None)
     }
 }
+
+pub fn clear_all_caches() -> Result<(), DiskCacheError> {
+    let cache_dir = dirs::cache_dir().unwrap_or("./cache".into());
+    let dir = cache_dir.join(env!("CARGO_PKG_NAME"));
+    fs::remove_dir_all(dir)?;
+    Ok(())
+}

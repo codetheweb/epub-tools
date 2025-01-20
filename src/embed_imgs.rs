@@ -1,3 +1,4 @@
+use crate::device_profiles::DeviceProfile;
 use crate::disk_cache::DiskCache;
 use crate::download::DownloadError;
 use crate::download::Downloader;
@@ -73,7 +74,22 @@ enum FileToZip {
     },
 }
 
-pub async fn embed_images(input_path: String, output_path: String) {
+pub async fn embed_images(
+    input_path: String,
+    output_path: String,
+    download_concurrency: usize,
+    device_profile: DeviceProfile,
+) {
+    let pool_size = std::thread::available_parallelism()
+    .map(|p| (usize::from(p)).max(3) - 2)
+    .unwrap_or(1); // Tokio uses 2 threads
+let cpu_pool = Arc::new(
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(pool_size)
+        .build()
+        .unwrap(),
+);
+
     // Progress bars
     let progress_bar_style = ProgressStyle::with_template(
         "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg} ({eta})",
@@ -98,16 +114,6 @@ pub async fn embed_images(input_path: String, output_path: String) {
     zip_pb.set_style(progress_bar_style.clone());
     zip_pb.set_message("📦 creating .epub");
 
-    let pool_size = std::thread::available_parallelism()
-        .map(|p| (usize::from(p)).min(3) - 2)
-        .unwrap_or(1); // Tokio uses 2 threads
-    let cpu_pool = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(pool_size)
-            .build()
-            .unwrap(),
-    );
-
     // State
     let mut tasks = FuturesUnordered::new();
 
@@ -118,6 +124,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
         DiskCache::create("optimized_images").unwrap();
     let total_original_image_size = Arc::new(AtomicUsize::new(0));
     let total_optimized_image_size = Arc::new(AtomicUsize::new(0));
+    let download_errors = Arc::new(Mutex::new(HashMap::new()));
 
     // Zip creation task
     {
@@ -344,14 +351,15 @@ pub async fn embed_images(input_path: String, output_path: String) {
     };
 
     let (optimize_file_tx, mut optimize_file_rx) =
-        tokio::sync::mpsc::channel::<(Url, Result<Vec<u8>, DownloadError>)>(pool_size * 2);
+        tokio::sync::mpsc::channel::<(Url, Result<Vec<u8>, DownloadError>)>(pool_size * 20);
 
     {
         let optimize_pb = optimize_pb.clone();
+        let download_errors = download_errors.clone();
         let download_task = tokio::spawn(async move {
             let mut download_stream = futures::stream::iter(urls_to_download.unwrap())
                 .map(|url| async { (url.clone(), download_manager.download(url).await) })
-                .buffer_unordered(10);
+                .buffer_unordered(download_concurrency);
 
             while let Some((url, result)) = download_stream.next().await {
                 match result {
@@ -363,10 +371,9 @@ pub async fn embed_images(input_path: String, output_path: String) {
                             .await
                             .unwrap();
                     }
-                    Err(_) => {
-                        download_pb.inc(1);
-                        optimize_pb.inc_length(1);
-                        optimize_file_tx.send((url, Ok(Vec::new()))).await.unwrap();
+                    Err(err) => {
+                        let mut download_errors = download_errors.lock().unwrap();
+                        download_errors.insert(url.clone(), err);
                     }
                 }
             }
@@ -408,9 +415,13 @@ pub async fn embed_images(input_path: String, output_path: String) {
                             match optimize_image(
                                 &file_contents,
                                 ImageOptimizationSettings {
-                                    is_grayscale: true,
+                                    is_grayscale: device_profile.is_grayscale(),
                                     key: path.clone(),
-                                    max_width: Some(width.map(|w| w.min(1200)).unwrap_or(1200)),
+                                    max_width: Some(
+                                        width
+                                            .map(|w| w.min(device_profile.max_width() as u32))
+                                            .unwrap_or(device_profile.max_width() as u32),
+                                    ),
                                 },
                                 optimized_image_cache,
                             ) {
@@ -468,4 +479,19 @@ pub async fn embed_images(input_path: String, output_path: String) {
             100.0 - (total_optimized_image_size as f64 / total_original_image_size as f64) * 100.0
         ))
         .unwrap();
+
+    let download_errors = download_errors.lock().unwrap();
+    if !download_errors.is_empty() {
+        progress_bars
+            .println(format!(
+                "\nFailed to download {} images:",
+                download_errors.len()
+            ))
+            .unwrap();
+        for (url, err) in download_errors.iter() {
+            progress_bars
+                .println(format!("{}: {:?}", url, err))
+                .unwrap();
+        }
+    }
 }

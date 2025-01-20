@@ -1,4 +1,5 @@
 use crate::disk_cache::{DiskCache, DiskCacheError};
+use backon::{ExponentialBuilder, Retryable};
 use cache_control::CacheControl;
 use reqwest::{
     header::{CACHE_CONTROL, LAST_MODIFIED},
@@ -85,26 +86,30 @@ impl Downloader {
             }
         }
 
-        let response = self.client.get(url.clone()).send().await.unwrap(); // todo: retry on error
-        if let Err(err) = response.error_for_status_ref() {
-            return Err(err.into());
-        }
+        let download = || async {
+            let response = self.client.get(url.clone()).send().await?;
+            if let Err(err) = response.error_for_status_ref() {
+                return Err(err.into());
+            }
 
-        let etag = self.update_url_etag_cache(&response)?;
-        // File may still exist/be unmodified, but past its cache-control expiry
-        if let Some(file) = self.etag_to_file_cache.get(&etag)? {
-            return Ok(DownloadedFile {
+            let etag = self.update_url_etag_cache(&response)?;
+            // File may still exist/be unmodified, but past its cache-control expiry
+            if let Some(file) = self.etag_to_file_cache.get(&etag)? {
+                return Ok(DownloadedFile {
+                    contents: file,
+                    was_cached: true,
+                });
+            }
+
+            let file = response.bytes().await?.to_vec();
+            self.etag_to_file_cache.set(&etag, &file, 1000000000000)?; // etag should be immutable
+
+            Ok(DownloadedFile {
                 contents: file,
-                was_cached: true,
-            });
-        }
+                was_cached: false,
+            })
+        };
 
-        let file = response.bytes().await.unwrap().to_vec();
-        self.etag_to_file_cache.set(&etag, &file, 1000000000000)?; // etag should be immutable
-
-        Ok(DownloadedFile {
-            contents: file,
-            was_cached: false,
-        })
+        download.retry(ExponentialBuilder::default()).await
     }
 }
