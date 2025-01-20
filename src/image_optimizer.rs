@@ -53,7 +53,7 @@ fn load_and_transform(
 pub fn optimize_image(
     image: &[u8],
     settings: ImageOptimizationSettings,
-    cache: DiskCache<ImageOptimizationSettings, Vec<u8>>,
+    cache: &DiskCache<ImageOptimizationSettings, Vec<u8>>,
 ) -> Result<Vec<u8>, OptimizeImageError> {
     if let Some(cached) = cache.get(&settings)? {
         return Ok(cached);

@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use embed_images::embed_images;
+use embed_imgs::embed_images;
 
 mod disk_cache;
-mod downloader;
-mod embed_images;
+mod download;
+mod embed_imgs;
 mod image_optimizer;
 
 #[derive(Parser, Debug)]
@@ -28,5 +28,8 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Args::parse();
+    // let mut command = EmbedImagesCommand::new(cli.input, cli.output);
+    // command.run().await;
+
     embed_images(cli.input, cli.output).await;
 }
