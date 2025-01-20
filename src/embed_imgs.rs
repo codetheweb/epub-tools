@@ -98,11 +98,6 @@ pub async fn embed_images(input_path: String, output_path: String) {
     zip_pb.set_style(progress_bar_style.clone());
     zip_pb.set_message("📦 creating .epub");
 
-    let io_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(100)
-        .build()
-        .unwrap();
-
     let cpu_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(10)
@@ -115,7 +110,6 @@ pub async fn embed_images(input_path: String, output_path: String) {
 
     let (zip_file_tx, zip_file_rx) = std::sync::mpsc::channel::<FileToZip>();
     let image_info = Arc::new(Mutex::new(HashMap::new()));
-    let (download_file_queue_tx, download_file_queue_rx) = std::sync::mpsc::channel::<Url>();
     let download_manager = Downloader::create().unwrap();
     let optimized_image_cache: DiskCache<ImageOptimizationSettings, Vec<u8>> =
         DiskCache::create("optimized_images").unwrap();
@@ -159,7 +153,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
     }
 
     // Input read task
-    let (html_tx, html_rx) = std::sync::mpsc::sync_channel::<(String, Vec<u8>)>(20); // todo: set to pool size
+    let (html_tx, html_rx) = std::sync::mpsc::sync_channel::<(String, Vec<u8>)>(200); // todo: set to pool size
     {
         let html_pb = html_pb.clone();
         let zip_pb = zip_pb.clone();
@@ -186,32 +180,32 @@ pub async fn embed_images(input_path: String, output_path: String) {
                         .unwrap();
                 }
             }
-
             drop(html_tx);
         });
         tasks.push(input_read_task);
     }
 
     // HTML parse task
-    {
+    let urls_to_download = {
         let download_pb = download_pb.clone();
-        let zip_pb = zip_pb.clone();
         let zip_file_tx = zip_file_tx.clone();
+        let zip_pb = zip_pb.clone();
         let image_info = image_info.clone();
         let cpu_pool = cpu_pool.clone();
 
-        let html_parse_task = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking::<_, Vec<Url>>(move || {
             cpu_pool.install(|| {
                 html_rx
                     .into_iter()
                     .par_bridge()
-                    .map(|(file_name, html_file)| {
+                    .flat_map(|(file_name, html_file)| {
                         let mut reader = Reader::from_reader(Cursor::new(html_file));
                         reader.config_mut().trim_text(true);
 
                         let mut writer = quick_xml::writer::Writer::new(Cursor::new(Vec::new()));
 
                         let mut buf = Vec::new();
+                        let mut urls_to_download = Vec::new();
 
                         loop {
                             match reader.read_event_into(&mut buf) {
@@ -261,8 +255,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
                                                     )
                                                     .is_none()
                                                 {
-                                                    download_file_queue_tx.send(url).unwrap();
-                                                    download_pb.inc_length(1);
+                                                    urls_to_download.push(url);
                                                     let html_dir =
                                                         Path::new(&file_name).parent().unwrap();
                                                     rewrite_src(
@@ -302,8 +295,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
                                                     )
                                                     .is_none()
                                                 {
-                                                    download_file_queue_tx.send(url).unwrap();
-                                                    download_pb.inc_length(1);
+                                                    urls_to_download.push(url);
                                                     let html_dir =
                                                         Path::new(&file_name).parent().unwrap();
                                                     rewrite_src(
@@ -329,130 +321,131 @@ pub async fn embed_images(input_path: String, output_path: String) {
                         }
 
                         html_pb.inc(1);
+                        download_pb.inc_length(urls_to_download.len() as u64);
 
-                        (file_name, writer.into_inner().into_inner())
-                    })
-                    .for_each(|(file_name, file)| {
                         zip_pb.inc_length(1);
                         zip_file_tx
                             .send(FileToZip::NewFile {
                                 name: file_name.to_string(),
-                                contents: file,
+                                contents: writer.into_inner().into_inner(),
                                 compressed: true,
                             })
                             .unwrap();
-                    });
-            });
 
-            drop(download_file_queue_tx);
+                        urls_to_download
+                    })
+                    .collect()
+            })
+        })
+        .await
+    };
+
+    let (optimize_file_tx, mut optimize_file_rx) =
+        tokio::sync::mpsc::channel::<(Url, Result<Vec<u8>, DownloadError>)>(20000); // todo
+
+    {
+        let optimize_pb = optimize_pb.clone();
+        let download_task = tokio::spawn(async move {
+            let mut download_stream = futures::stream::iter(urls_to_download.unwrap())
+                .map(|url| async { (url.clone(), download_manager.download(url).await) })
+                .buffer_unordered(10);
+
+            while let Some((url, result)) = download_stream.next().await {
+                match result {
+                    Ok(downloaded_file) => {
+                        download_pb.inc(1);
+                        optimize_pb.inc_length(1);
+                        optimize_file_tx
+                            .send((url, Ok(downloaded_file.contents)))
+                            .await
+                            .unwrap();
+                    }
+                    Err(_) => {
+                        download_pb.inc(1);
+                        optimize_pb.inc_length(1);
+                        optimize_file_tx.send((url, Ok(Vec::new()))).await.unwrap();
+                    }
+                }
+            }
         });
-        tasks.push(html_parse_task);
+        tasks.push(download_task);
     }
 
-    // Download task
+    // Optimize task
     {
         let optimize_pb = optimize_pb.clone();
         let total_original_image_size = total_original_image_size.clone();
         let total_optimized_image_size = total_optimized_image_size.clone();
-        let download_and_optimize_task = tokio::task::spawn_blocking(move || {
-            io_pool.install(move || {
-                download_file_queue_rx
-                    .into_iter()
-                    .par_bridge()
-                    .map_with(
-                        (download_manager, download_pb),
-                        |(download_manager, download_pb), url| match download_manager
-                            .download(url.clone())
-                        {
-                            Ok(downloaded_file) => {
-                                download_pb.inc(1);
-                                return Ok((url, downloaded_file.contents));
-                            }
-                            Err(_) => {
-                                //Err(e),
-                                download_pb.inc(1);
-                                return Ok((url, Vec::new()));
-                            }
-                        },
-                    )
-                    .map_with(
-                        (
-                            optimized_image_cache,
-                            total_optimized_image_size,
-                            zip_pb,
-                            zip_file_tx,
-                            cpu_pool,
-                        ),
-                        |(
-                            optimized_image_cache,
-                            total_optimized_image_size,
-                            zip_pb,
-                            zip_file_tx,
-                            cpu_pool,
-                        ),
-                         result: Result<(Url, Vec<u8>), DownloadError>| {
-                            cpu_pool.install(|| {
-                                let (url, file_contents) = result.unwrap();
-                                total_original_image_size.fetch_add(
-                                    file_contents.len(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+        let zip_file_tx = zip_file_tx.clone();
 
-                                let path = compute_download_path(&url);
-                                let width = {
-                                    let mut image_info = image_info.lock().unwrap();
-                                    let info = image_info.get_mut(&url).unwrap();
-                                    info.mimetype = infer::get(&file_contents);
-                                    info.displayed_width
-                                };
+        let optimize_task = tokio::task::spawn_blocking(move || {
+            let iter = std::iter::from_fn(|| optimize_file_rx.blocking_recv());
 
-                                match optimize_image(
-                                    &file_contents,
-                                    ImageOptimizationSettings {
-                                        is_grayscale: true,
-                                        key: path.clone(),
-                                        max_width: Some(width.map(|w| w.min(1200)).unwrap_or(1200)),
-                                    },
-                                    optimized_image_cache,
-                                ) {
-                                    Ok(optimized) => {
-                                        total_optimized_image_size.fetch_add(
-                                            optimized.len(),
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        zip_pb.inc_length(1);
-                                        zip_file_tx
-                                            .send(FileToZip::NewFile {
-                                                name: path,
-                                                contents: optimized,
-                                                compressed: false,
-                                            })
-                                            .unwrap();
-                                    }
-                                    Err(OptimizeImageError::UnsupportedImageFormat(_)) => {
-                                        zip_pb.inc_length(1);
-                                        zip_file_tx
-                                            .send(FileToZip::NewFile {
-                                                name: path,
-                                                contents: file_contents,
-                                                compressed: false,
-                                            })
-                                            .unwrap();
-                                    }
-                                    Err(e) => {
-                                        panic!("Error optimizing image: {:?}", e);
+            cpu_pool.install(move || {
+                iter.par_bridge()
+                    .map_with(
+                        (optimized_image_cache, total_optimized_image_size),
+                        |(optimized_image_cache, total_optimized_image_size),
+                         result: (Url, Result<Vec<u8>, DownloadError>)| {
+                            let (url, result) = result;
+                            let file_contents = result.unwrap();
+                            total_original_image_size.fetch_add(
+                                file_contents.len(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+
+                            let path = compute_download_path(&url);
+                            let width = {
+                                let mut image_info = image_info.lock().unwrap();
+                                let info = image_info.get_mut(&url).unwrap();
+                                info.mimetype = infer::get(&file_contents);
+                                info.displayed_width
+                            };
+
+                            match optimize_image(
+                                &file_contents,
+                                ImageOptimizationSettings {
+                                    is_grayscale: true,
+                                    key: path.clone(),
+                                    max_width: Some(width.map(|w| w.min(1200)).unwrap_or(1200)),
+                                },
+                                optimized_image_cache,
+                            ) {
+                                Ok(optimized) => {
+                                    total_optimized_image_size.fetch_add(
+                                        optimized.len(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    FileToZip::NewFile {
+                                        name: path,
+                                        contents: optimized,
+                                        compressed: false,
                                     }
                                 }
-
-                                optimize_pb.inc(1);
-                            })
+                                Err(OptimizeImageError::UnsupportedImageFormat(_)) => {
+                                    FileToZip::NewFile {
+                                        name: path,
+                                        contents: file_contents,
+                                        compressed: false,
+                                    }
+                                }
+                                Err(e) => {
+                                    panic!("Error optimizing image: {:?}", e);
+                                }
+                            }
                         },
                     )
-                    .for_each(|_| {});
+                    .for_each(|file| {
+                        zip_pb.inc_length(1);
+                        optimize_pb.inc(1);
+                        zip_file_tx.send(file).unwrap();
+                    });
             });
         });
-        tasks.push(download_and_optimize_task);
+        tasks.push(optimize_task);
     }
+
+    drop(zip_file_tx);
 
     while let Some(task) = tasks.next().await {
         task.unwrap();

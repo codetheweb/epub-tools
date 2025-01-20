@@ -28,6 +28,7 @@ mozjpeg = {version = "0.10.12", features = ["nasm_simd"]}
 image = "0.25.5"
 oxipng = { version = "9.0", features = ["parallel", "zopfli", "filetime"], default-features = false }
 indicatif = "0.17.9"
+tokio-stream = "0.1.17"
 
 [profile.dev]
 panic = "abort"

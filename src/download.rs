@@ -1,9 +1,8 @@
 use crate::disk_cache::{DiskCache, DiskCacheError};
 use cache_control::CacheControl;
 use reqwest::{
-    blocking::{Client, Response},
     header::{CACHE_CONTROL, LAST_MODIFIED},
-    IntoUrl,
+    Client, IntoUrl, Response,
 };
 use thiserror::Error;
 
@@ -16,6 +15,7 @@ pub struct Downloader {
 
 pub struct DownloadedFile {
     pub contents: Vec<u8>,
+    #[allow(dead_code)]
     pub was_cached: bool,
 }
 
@@ -72,7 +72,7 @@ impl Downloader {
         })
     }
 
-    pub fn download<U: IntoUrl>(&self, url: U) -> Result<DownloadedFile, DownloadError> {
+    pub async fn download<U: IntoUrl>(&self, url: U) -> Result<DownloadedFile, DownloadError> {
         let url = url.into_url()?;
         let url_str = url.as_str().to_string();
 
@@ -85,7 +85,7 @@ impl Downloader {
             }
         }
 
-        let response = self.client.get(url.clone()).send().unwrap(); // todo: retry on error
+        let response = self.client.get(url.clone()).send().await.unwrap(); // todo: retry on error
         if let Err(err) = response.error_for_status_ref() {
             return Err(err.into());
         }
@@ -99,7 +99,7 @@ impl Downloader {
             });
         }
 
-        let file = response.bytes().unwrap().to_vec();
+        let file = response.bytes().await.unwrap().to_vec();
         self.etag_to_file_cache.set(&etag, &file, 1000000000000)?; // etag should be immutable
 
         Ok(DownloadedFile {
