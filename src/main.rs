@@ -25,7 +25,7 @@ enum Commands {
     EmbedImages,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let cli = Args::parse();
     embed_images(cli.input, cli.output).await;

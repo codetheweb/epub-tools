@@ -98,9 +98,12 @@ pub async fn embed_images(input_path: String, output_path: String) {
     zip_pb.set_style(progress_bar_style.clone());
     zip_pb.set_message("📦 creating .epub");
 
+    let pool_size = std::thread::available_parallelism()
+        .map(|p| (usize::from(p)).min(3) - 2)
+        .unwrap_or(1); // Tokio uses 2 threads
     let cpu_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(10)
+            .num_threads(pool_size)
             .build()
             .unwrap(),
     );
@@ -153,7 +156,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
     }
 
     // Input read task
-    let (html_tx, html_rx) = std::sync::mpsc::sync_channel::<(String, Vec<u8>)>(200); // todo: set to pool size
+    let (html_tx, html_rx) = std::sync::mpsc::sync_channel::<(String, Vec<u8>)>(pool_size * 2);
     {
         let html_pb = html_pb.clone();
         let zip_pb = zip_pb.clone();
@@ -341,7 +344,7 @@ pub async fn embed_images(input_path: String, output_path: String) {
     };
 
     let (optimize_file_tx, mut optimize_file_rx) =
-        tokio::sync::mpsc::channel::<(Url, Result<Vec<u8>, DownloadError>)>(20000); // todo
+        tokio::sync::mpsc::channel::<(Url, Result<Vec<u8>, DownloadError>)>(pool_size * 2);
 
     {
         let optimize_pb = optimize_pb.clone();
