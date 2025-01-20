@@ -28,8 +28,5 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Args::parse();
-    // let mut command = EmbedImagesCommand::new(cli.input, cli.output);
-    // command.run().await;
-
     embed_images(cli.input, cli.output).await;
 }

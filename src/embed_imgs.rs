@@ -352,6 +352,8 @@ pub async fn embed_images(input_path: String, output_path: String) {
     // Download task
     {
         let optimize_pb = optimize_pb.clone();
+        let total_original_image_size = total_original_image_size.clone();
+        let total_optimized_image_size = total_optimized_image_size.clone();
         let download_and_optimize_task = tokio::task::spawn_blocking(move || {
             io_pool.install(move || {
                 download_file_queue_rx
@@ -455,4 +457,19 @@ pub async fn embed_images(input_path: String, output_path: String) {
     while let Some(task) = tasks.next().await {
         task.unwrap();
     }
+
+    let total_original_image_size =
+        total_original_image_size.load(std::sync::atomic::Ordering::Relaxed);
+    let total_optimized_image_size =
+        total_optimized_image_size.load(std::sync::atomic::Ordering::Relaxed);
+
+    progress_bars
+        .println(format!(
+            "Saved {} ({:.1}%) by optimizing images.",
+            human_bytes::human_bytes(
+                total_original_image_size as f64 - total_optimized_image_size as f64
+            ),
+            100.0 - (total_optimized_image_size as f64 / total_original_image_size as f64) * 100.0
+        ))
+        .unwrap();
 }
