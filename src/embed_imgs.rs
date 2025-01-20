@@ -81,14 +81,14 @@ pub async fn embed_images(
     device_profile: DeviceProfile,
 ) {
     let pool_size = std::thread::available_parallelism()
-    .map(|p| (usize::from(p)).max(3) - 2)
-    .unwrap_or(1); // Tokio uses 2 threads
-let cpu_pool = Arc::new(
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(pool_size)
-        .build()
-        .unwrap(),
-);
+        .map(|p| (usize::from(p)).max(3) - 2)
+        .unwrap_or(1); // Tokio uses 2 threads
+    let cpu_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(pool_size)
+            .build()
+            .unwrap(),
+    );
 
     // Progress bars
     let progress_bar_style = ProgressStyle::with_template(
@@ -200,6 +200,7 @@ let cpu_pool = Arc::new(
         let download_pb = download_pb.clone();
         let zip_file_tx = zip_file_tx.clone();
         let zip_pb = zip_pb.clone();
+        let optimize_pb = optimize_pb.clone();
         let image_info = image_info.clone();
         let cpu_pool = cpu_pool.clone();
 
@@ -332,6 +333,7 @@ let cpu_pool = Arc::new(
 
                         html_pb.inc(1);
                         download_pb.inc_length(urls_to_download.len() as u64);
+                        optimize_pb.inc_length(urls_to_download.len() as u64);
 
                         zip_pb.inc_length(1);
                         zip_file_tx
@@ -351,10 +353,9 @@ let cpu_pool = Arc::new(
     };
 
     let (optimize_file_tx, mut optimize_file_rx) =
-        tokio::sync::mpsc::channel::<(Url, Result<Vec<u8>, DownloadError>)>(pool_size * 20);
+        tokio::sync::mpsc::channel::<(Url, Result<Vec<u8>, DownloadError>)>(pool_size * 2);
 
     {
-        let optimize_pb = optimize_pb.clone();
         let download_errors = download_errors.clone();
         let download_task = tokio::spawn(async move {
             let mut download_stream = futures::stream::iter(urls_to_download.unwrap())
@@ -365,7 +366,6 @@ let cpu_pool = Arc::new(
                 match result {
                     Ok(downloaded_file) => {
                         download_pb.inc(1);
-                        optimize_pb.inc_length(1);
                         optimize_file_tx
                             .send((url, Ok(downloaded_file.contents)))
                             .await
