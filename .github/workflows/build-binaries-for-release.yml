@@ -40,11 +40,11 @@ jobs:
           args: --release
 
       - name: Prefix binary name
-        run: cp target/release/epub-tools target/release/epub-tools-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}
+        run: mv target/release/epub-tools target/release/epub-tools-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}
         continue-on-error: true
 
       - name: Prefix binary name
-        run: cp target/release/epub-tools.exe target/release/epub-tools-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}.exe
+        run: mv target/release/epub-tools.exe target/release/epub-tools-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}.exe
         continue-on-error: true
 
       - name: Add to release
