@@ -1,0 +1,53 @@
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+name: Build binaries for release
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest, nscloud-ubuntu-22.04-arm64, nscloud-macos-sequoia-arm64-12x28]
+        include:
+          - os: ubuntu-latest
+            arch: x64
+            platform: linux
+          - os: windows-latest
+            arch: x64
+            platform: windows
+          - os: macos-latest
+            arch: x64
+            platform: darwin
+          - os: nscloud-ubuntu-22.04-arm64
+            arch: arm64
+            platform: linux
+          - os: nscloud-macos-sequoia-arm64-12x28
+            arch: arm64
+            platform: darwin
+    steps:
+      - uses: actions/checkout@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build in release mode
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release
+
+      - name: Prefix binary name
+        run: cp target/release/epub-tools target/release/epub-tools-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}
+        continue-on-error: true
+
+      - name: Prefix binary name
+        run: cp target/release/epub-tools.exe target/release/epub-tools-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}.exe
+        continue-on-error: true
+
+      - name: Add to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/epub-tools!(*.d|*.pdb)
